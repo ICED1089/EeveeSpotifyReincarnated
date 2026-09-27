@@ -3,8 +3,13 @@ name: Build spoti.pw 0.22 + Eevee
 on:
   workflow_dispatch:
     inputs:
+      spotify_version:
+        description: 'Spotify IPA version to build'
+        required: true
+        default: '9.1.78'
+        type: string
       ipa_url:
-        description: "Direct URL to decrypted Spotify 9.1.78 IPA"
+        description: "Direct URL to decrypted Spotify IPA"
         required: true
         type: string
       upload_method:
@@ -63,6 +68,7 @@ jobs:
       - name: Download Spotify IPA
         run: |
           mkdir -p spoti/ipa
+          echo "SPOTIFY_VERSION=${{ inputs.spotify_version }}" >> "$GITHUB_ENV"
           curl -fsSL "${{ inputs.ipa_url }}" -o spoti/ipa/spotify.ipa
           case "$(file --mime-type -b spoti/ipa/spotify.ipa)" in
             application/zip|application/x-ios-app) ;;
@@ -72,8 +78,8 @@ jobs:
           VERSION=$(unzip -p spoti/ipa/spotify.ipa 'Payload/*.app/Info.plist' 2>/dev/null \
             | plutil -extract CFBundleShortVersionString raw - 2>/dev/null || true)
           echo "Spotify version: $VERSION"
-          [ "$VERSION" = "9.1.78" ] || {
-            echo "::error::spoti.pw v0.22.0 expects Spotify 9.1.78; got '$VERSION'"
+          [ "$VERSION" = "${{ inputs.spotify_version }}" ] || {
+            echo "::error::Requested Spotify ${{ inputs.spotify_version }}; IPA contains '$VERSION'"
             exit 1
           }
 
@@ -117,7 +123,7 @@ jobs:
           [ -n "$BUNDLE" ] && INJECT+=("$BUNDLE")
 
           mkdir -p output
-          OUT="$GITHUB_WORKSPACE/output/Spotify-9.1.78-spoti.pw-0.22.0-Eevee.ipa"
+          OUT="$GITHUB_WORKSPACE/output/Spotify-${SPOTIFY_VERSION}-spoti.pw-0.22.0-Eevee.ipa"
 
           # Do not use -u/-du and do not run Eevee's strip-ipa.sh.
           # Those remove extensions that spoti.pw needs for widgets/Live Activity.
