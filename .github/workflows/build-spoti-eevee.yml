@@ -1,12 +1,17 @@
-name: Build spoti.pw 0.22 + Eevee
+name: Build Chroma + Eevee
 
 on:
   workflow_dispatch:
     inputs:
       spotify_version:
-        description: 'Spotify IPA version to build'
+        description: "Spotify version label (auto = detect from IPA; any version allowed)"
         required: true
-        default: '9.1.78'
+        default: "auto"
+        type: string
+      chroma_version:
+        description: "Chroma release: latest, beta, or a tag like v0.50.0"
+        required: true
+        default: "latest"
         type: string
       ipa_url:
         description: "Direct URL to decrypted Spotify IPA"
@@ -37,19 +42,17 @@ jobs:
           path: eevee
           submodules: recursive
 
-      - name: Checkout spoti.pw v0.22.0
-        uses: actions/checkout@v4
-        with:
-          repository: skopevoj/spoti.pw
-          ref: v0.22.0
-          path: spoti
-          submodules: recursive
-
       - uses: levibostian/action-hide-sensitive-inputs@v1
+        with:
+          exclude_inputs: spotify_version,chroma_version,upload_method
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
 
       - uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          xcode-version: "26.3.0"
 
       - name: Setup Theos
         uses: actions/checkout@v4
@@ -65,30 +68,67 @@ jobs:
           python3 -m pip install --upgrade --break-system-packages \
             git+https://github.com/asdfzxcvbn/pyzule-rw.git
 
+          ARCH=$(uname -m)
+          [ "$ARCH" = "x86_64" ] && SUFFIX=macos-amd64 || SUFFIX=macos-arm64
+          sudo curl -fsSL \
+            "https://github.com/asdfzxcvbn/ipapatch/releases/latest/download/ipapatch.${SUFFIX}" \
+            -o /usr/local/bin/ipapatch
+          sudo chmod +x /usr/local/bin/ipapatch
+          ipapatch --help >/dev/null
+
       - name: Download Spotify IPA
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
+          REQUESTED_VERSION: ${{ inputs.spotify_version }}
         run: |
-          mkdir -p spoti/ipa
-          echo "SPOTIFY_VERSION=${{ inputs.spotify_version }}" >> "$GITHUB_ENV"
-          curl -fsSL "${{ inputs.ipa_url }}" -o spoti/ipa/spotify.ipa
-          case "$(file --mime-type -b spoti/ipa/spotify.ipa)" in
+          curl -fsSL --retry 3 "$IPA_URL" -o spotify.ipa
+          case "$(file --mime-type -b spotify.ipa)" in
             application/zip|application/x-ios-app) ;;
             *) echo "::error::Downloaded file is not an IPA"; exit 1 ;;
           esac
 
-          VERSION=$(unzip -p spoti/ipa/spotify.ipa 'Payload/*.app/Info.plist' 2>/dev/null \
+          VERSION=$(unzip -p spotify.ipa 'Payload/*.app/Info.plist' 2>/dev/null \
             | plutil -extract CFBundleShortVersionString raw - 2>/dev/null || true)
+          [ -n "$VERSION" ] || { echo "::error::Could not detect Spotify version"; exit 1; }
           echo "Spotify version: $VERSION"
-          [ "$VERSION" = "${{ inputs.spotify_version }}" ] || {
-            echo "::error::Requested Spotify ${{ inputs.spotify_version }}; IPA contains '$VERSION'"
-            exit 1
-          }
 
-      - name: Build spoti.pw v0.22.0
-        working-directory: spoti
+          if [ "$REQUESTED_VERSION" != "auto" ] && [ "$VERSION" != "$REQUESTED_VERSION" ]; then
+            echo "::error::Requested Spotify $REQUESTED_VERSION; IPA contains '$VERSION'"
+            exit 1
+          fi
+
+          echo "SPOTIFY_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Download Chroma patch kit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.chroma_version }}
         run: |
-          make release
-          test -f out/spoti.pw-0.22.0.ipa
-          echo "SPOTI_IPA=$GITHUB_WORKSPACE/spoti/out/spoti.pw-0.22.0.ipa" >> "$GITHUB_ENV"
+          REPO="skopevoj/spoti.pw"
+          TAG=$(gh api "repos/$REPO/releases?per_page=100" | jq -r --arg v "$VERSION" '
+            [.[] | select((.draft | not) and any(.assets[]; .name | endswith("-kit.zip")))]
+            | if $v == "latest" then map(select(.prerelease | not))
+              elif $v == "beta" then .
+              else map(select(.tag_name == "v" + ($v | ltrimstr("v")))) end
+            | first.tag_name // empty')
+
+          [ -n "$TAG" ] || { echo "::error::$REPO has no Chroma release '$VERSION' with a patch kit"; exit 1; }
+          echo "Using Chroma $TAG"
+          echo "CHROMA_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "CHROMA_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+          gh release download "$TAG" -R "$REPO" -p '*-kit.zip' -O chroma-kit.zip
+          curl -fsSL --retry 3 -o patcher.mjs https://chroma.pw/patcher.mjs
+
+      - name: Patch Spotify with Chroma
+        run: |
+          rm -rf chroma-out
+          node patcher.mjs spotify.ipa chroma-kit.zip chroma-out
+
+          CHROMA_IPA=$(find chroma-out -maxdepth 1 -type f -name '*.ipa' | head -1)
+          [ -n "$CHROMA_IPA" ] || { echo "::error::Chroma patcher did not produce an IPA"; exit 1; }
+          echo "CHROMA_IPA=$GITHUB_WORKSPACE/$CHROMA_IPA" >> "$GITHUB_ENV"
+          ls -lh "$CHROMA_IPA"
 
       - name: Build EeveeSwiftProtobuf.framework
         working-directory: eevee
@@ -106,9 +146,18 @@ jobs:
           [ -n "$DEB_PATH" ] || { echo "::error::Eevee .deb not produced"; exit 1; }
           echo "EEVEE_DEB=$GITHUB_WORKSPACE/eevee/$DEB_PATH" >> "$GITHUB_ENV"
 
-      - name: Inject Eevee into spoti.pw IPA
+      - name: Build Eevee sideload shim
+        working-directory: eevee
+        run: |
+          chmod +x Tools/build-zxpi.sh
+          Tools/build-zxpi.sh
+          test -f packages/zxPluginsInject.dylib
+          echo "ZXPI_DYLIB=$GITHUB_WORKSPACE/eevee/packages/zxPluginsInject.dylib" >> "$GITHUB_ENV"
+
+      - name: Inject Eevee into Chroma IPA
         run: |
           EXTRACT="$RUNNER_TEMP/eevee-deb"
+          rm -rf "$EXTRACT"
           mkdir -p "$EXTRACT"
           dpkg-deb -R "$EEVEE_DEB" "$EXTRACT"
 
@@ -123,23 +172,33 @@ jobs:
           [ -n "$BUNDLE" ] && INJECT+=("$BUNDLE")
 
           mkdir -p output
-          OUT="$GITHUB_WORKSPACE/output/Spotify-${SPOTIFY_VERSION}-spoti.pw-0.22.0-Eevee.ipa"
+          OUT="$GITHUB_WORKSPACE/output/Spotify-${SPOTIFY_VERSION}-Chroma-${CHROMA_VERSION}-Eevee.ipa"
 
-          # Do not use -u/-du and do not run Eevee's strip-ipa.sh.
-          # Those remove extensions that spoti.pw needs for widgets/Live Activity.
-          cyan -i "$SPOTI_IPA" -o "$OUT" -f "${INJECT[@]}" -c 9 -m 15.0 -s --overwrite
+          # Keep Chroma's extensions intact. In particular, do not use -u/-du
+          # and do not run Eevee's strip-ipa.sh after Chroma has patched the IPA.
+          cyan -i "$CHROMA_IPA" -o "$OUT" -f "${INJECT[@]}" -c 9 -m 15.0 -s --overwrite
 
           echo "FINAL_IPA=$OUT" >> "$GITHUB_ENV"
+
+      - name: LC-inject Eevee sideload shim
+        run: |
+          ipapatch --input "$FINAL_IPA" --inplace --noconfirm \
+            --dylib "$ZXPI_DYLIB"
 
       - name: Verify combined IPA
         run: |
           unzip -l "$FINAL_IPA" | grep -q 'EeveeSpotify.dylib' || {
-            echo "::error::Eevee dylib not present in final IPA"
+            echo "::error::EeveeSpotify.dylib not present in final IPA"
+            exit 1
+          }
+
+          unzip -l "$FINAL_IPA" | grep -q 'zxPluginsInject.dylib' || {
+            echo "::error::zxPluginsInject.dylib not present in final IPA"
             exit 1
           }
 
           unzip -l "$FINAL_IPA" | grep -q 'SpotifyGlassLiveActivity.appex' || {
-            echo "::warning::SpotifyGlassLiveActivity.appex not found; build may lack Live Activity"
+            echo "::warning::Chroma Live Activity extension not found in final IPA"
           }
 
           echo "Combined IPA:"
@@ -147,16 +206,17 @@ jobs:
 
       - name: Upload artifact
         if: ${{ inputs.upload_method == 'artifacts' || inputs.upload_method == 'both' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: Spotify-spoti.pw-0.22.0-Eevee
+          name: Spotify-Chroma-${{ env.CHROMA_VERSION }}-Eevee
           path: ${{ env.FINAL_IPA }}
+          archive: false
           if-no-files-found: error
 
       - name: Upload to filebin.net
         if: ${{ inputs.upload_method == 'filebin' || inputs.upload_method == 'both' }}
         run: |
-          BIN="spoti-eevee-${{ github.run_id }}-${{ github.run_attempt }}"
+          BIN="chroma-eevee-${{ github.run_id }}-${{ github.run_attempt }}"
           NAME=$(basename "$FINAL_IPA")
           curl -fsS -X POST \
             -H "Content-Type: application/octet-stream" \
